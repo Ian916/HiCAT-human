@@ -54,7 +54,7 @@ HiCAT-human consists of 4 modules:
 * Reads HOR annotation: whole genome HiFi reads.
 * Assembly HOR annotation: haplotype-resolved human genome.
 
-For detail usage, read the docs on the `HiCAT-human` wiki.
+For detail usage, read the docs on the `HiCAT-human` [wiki](https://github.com/Ian916/HiCAT-human/wiki).
 
 ## Contact
 
