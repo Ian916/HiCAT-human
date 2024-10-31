@@ -1,0 +1,1352 @@
+import argparse
+import edlib
+import pandas as pd
+import numpy as np
+from joblib import Parallel, delayed
+import os
+
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpathes
+from matplotlib.lines import Line2D
+
+def buildMonomerBlockSequence(decomposition_path):
+    block_sequence = []
+    with open(decomposition_path, 'r') as bf:
+        while True:
+            line = bf.readline()[:-1]
+            if not line:
+                break
+            items = line.split('\t')
+            if items[1][-1] == "'":
+                block_sequence.append(items[0] + '_' + str(items[2]) + '_' + str(items[3]) + '_-')
+            else:
+                block_sequence.append(items[0] + '_' + str(items[2]) + '_' + str(items[3]) + '_+')
+
+    return block_sequence
+
+def readHiCATMonomers(file):
+    monomer_seq = {} # 与出现次数超过2个的代表monomer比较
+    monomer_number = {}
+    monomer = ''
+    with open(file,'r') as f:
+        while True:
+            line = f.readline()[:-1]
+            if not line:
+                break
+            if line.startswith('>'):
+                monomer_info = line[1:].split(' ')
+                monomer = monomer_info[0]
+                number = int(monomer_info[1])
+                monomer_number[monomer] = number
+            else:
+                monomer_seq[monomer] = line
+
+    select_monomers = set() # 选择至少出现2次的monomer
+    for i in monomer_number.keys():
+        if monomer_number[i] > 1:
+            select_monomers.add(i)
+    monomers = {}
+    for i in monomer_seq.keys():
+        monomer = i
+        if monomer in select_monomers:
+            monomers[monomer] = monomer_seq[i]
+    return monomers
+
+def ed_distance(sequenceA, sequenceB):
+    return (edlib.align(sequenceA,sequenceB))['editDistance'] / max(len(sequenceA), len(sequenceB))
+
+
+def ed_distance_apply(target, col):
+    return col.apply(ed_distance, args=(target,))
+
+
+def ed_distance_apply_apply(monomers,data, region):
+    return data[region[0]:region[1]]['seq'].apply(ed_distance_apply, args=(monomers['seq'],))
+
+def reverse(sequence):
+    base_map = {'A':'T','T':'A','C':'G','G':'C','N':'N'}
+    new_sequence = ''
+    for i in sequence[::-1]:
+        new_sequence += base_map[i]
+    return new_sequence
+
+def calculateED(block_sequence, monomers, base_sequence,thread):
+    names = []
+    seq = []
+    for i in block_sequence:
+        names.append(i)
+        items = i.split('_')
+        strand = items[3]
+        if strand == '-':
+            split_base_sequence = reverse(base_sequence[int(items[1]):int(items[2])])
+        else:
+            split_base_sequence = base_sequence[int(items[1]):int(items[2])]
+        seq.append(split_base_sequence)
+    data = pd.DataFrame({'name': names, 'seq': seq})
+    names = []
+    seq = []
+    for i in monomers.keys():
+        names.append(i)
+        seq.append(monomers[i])
+    monomers = pd.DataFrame({'name': names, 'seq': seq})
+
+    binsize = int(len(data) / thread) + 1
+    split_in = [[binsize * i, binsize * i + binsize] for i in range(thread)]
+    res = Parallel(n_jobs=thread)(delayed(ed_distance_apply_apply)(monomers,data, i) for i in split_in)
+    res = pd.concat(res)
+    edit_distance_matrix = np.array(res)
+    block_name_index = list(data['name'])
+    monomer_name_index = list(monomers['name'])
+    return edit_distance_matrix, block_name_index,monomer_name_index
+
+def miningMonomerTDPattern(new_monomer_sequence, max_hor_len):
+    new_monomer_sequence_index_left = []
+    new_monomer_sequence_index_right = []
+    for i in range(len(new_monomer_sequence)):
+        new_monomer_sequence_index_left.append(i)
+        new_monomer_sequence_index_right.append(i)
+    ori_monomer_sequence = new_monomer_sequence
+    top_layer = []
+    all_layer = []
+    all_layer_marker = set()
+    start_d = 1
+
+    while start_d < min(max_hor_len, len(new_monomer_sequence)):
+        monomer_sequence = new_monomer_sequence
+        # print('--------------------------')
+        monomer_sequence_index_left = new_monomer_sequence_index_left
+        monomer_sequence_index_right = new_monomer_sequence_index_right
+        candidate_pattern = {}
+        for i in range(len(monomer_sequence)):
+            if str(monomer_sequence[i]) not in candidate_pattern.keys():
+                candidate_pattern[str(monomer_sequence[i])] = [[i, i + 1, str(monomer_sequence[i])]]
+            else:
+                candidate_pattern[str(monomer_sequence[i])].append([i, i + 1, str(monomer_sequence[i])])
+
+        d_database = []
+        for i in candidate_pattern.keys():
+            pattern_database = candidate_pattern[i]
+            for j in range(len(pattern_database)):
+                current = pattern_database[j]
+                current_start = current[0]
+                if j == 0:
+                    continue
+                candidate_database = pattern_database[:j]
+                for k in candidate_database[::-1]:
+                    pre_database = k
+                    pre_start = pre_database[0]
+                    d = current_start - pre_start
+                    if d == start_d:
+                        d_database.append([pre_database, current])
+                    if d > start_d:
+                        break
+        if len(d_database) == 0:
+            start_d += 1
+            continue
+        else:
+            sorted_d_database = sorted(d_database, key=lambda x: x[0])
+            # print(sorted_d_database)
+            chain_list = []
+            chain = []
+            chain.append(sorted_d_database[0][0])
+            index = 1
+            while index < len(sorted_d_database):
+                if sorted_d_database[index][0][0] - sorted_d_database[index - 1][0][0] != 1:
+                    final_start = index - start_d
+                    if final_start >= 0:
+                        for i in range(start_d):
+                            chain.append(sorted_d_database[final_start + i][1])
+
+                    if int(len(chain) / start_d) > 1:
+                        chain_list.append(chain[:int(len(chain) / start_d) * start_d])
+                        # chain_list.append(chain)
+                    chain = [sorted_d_database[index][0]]
+                    index += 1
+                else:
+                    chain.append(sorted_d_database[index][0])
+                    index += 1
+                    if index >= len(sorted_d_database):
+                        final_start = index - start_d
+                        if final_start >= 0:
+                            for i in range(start_d):
+                                chain.append(sorted_d_database[final_start + i][1])
+                        if int(len(chain) / start_d) > 1:
+                            chain_list.append(chain[:int(len(chain) / start_d) * start_d])
+                            # chain_list.append(chain)
+                        chain = []
+                        break
+
+                    while sorted_d_database[index][0][0] - sorted_d_database[index - 1][0][0] == 1:
+                        chain.append(sorted_d_database[index][0])
+                        index += 1
+                        if index >= len(sorted_d_database):
+                            break
+                    final_start = index - start_d
+                    if final_start >= 0:
+                        for i in range(start_d):
+                            chain.append(sorted_d_database[final_start + i][1])
+                    if int(len(chain) / start_d) > 1:
+                        chain_list.append(chain[:int(len(chain) / start_d) * start_d])
+                        # chain_list.append(chain)
+                    chain = []
+            if len(chain) != 0:
+                final_start = index - start_d
+                if final_start >= 0:
+                    for i in range(start_d):
+                        chain.append(sorted_d_database[final_start + i][1])
+                if int(len(chain) / start_d) > 1:
+                    chain_list.append(chain[:int(len(chain) / start_d) * start_d])
+                    # chain_list.append(chain)
+            # print(start_d)
+            # print(chain_list)
+            tmp_top_layer = []
+            for i in range(len(chain_list)):
+                relative_start = chain_list[i][0][0]
+                relative_end = chain_list[i][-1][0]
+                absolute_start = monomer_sequence_index_left[relative_start]
+                absolute_end = monomer_sequence_index_right[relative_end]
+                if len(top_layer) == 0:
+                    relative_end = chain_list[i][int(len(chain_list[i]) / start_d) * start_d - 1][0]
+                    absolute_end = monomer_sequence_index_right[relative_end]
+                    TD_item = monomer_sequence[relative_start:relative_start + start_d]
+                    TD_count = int((relative_end - relative_start + 1) / start_d)
+                    TD_range_index = []
+                    start_td_item = -1
+                    end_td_item = -1
+                    new_start_td_item = relative_start
+                    new_end_td_item = relative_start + start_d - 1
+                    pattern_number = 1
+                    while True:
+                        start_td_item = new_start_td_item
+                        end_td_item = new_end_td_item
+                        if end_td_item > relative_end:
+                            break
+                        adding_flag = 1
+                        if monomer_sequence_index_right[end_td_item] in all_layer_marker:
+                            adding_flag = 0
+                        if adding_flag == 1:
+                            TD_range_index.append(
+                                [monomer_sequence_index_left[start_td_item], monomer_sequence_index_right[end_td_item],
+                                 TD_item, pattern_number])
+                            new_start_td_item = end_td_item + 1
+                            new_end_td_item = end_td_item + start_d
+                        else:
+                            pattern_number += 1
+                            new_start_td_item = start_td_item
+                            new_end_td_item = end_td_item + start_d
+                    td_pattern_item = [absolute_start, absolute_end, TD_item, TD_count, TD_range_index, relative_start,
+                                       relative_end]
+                    top_layer.append(td_pattern_item)
+                    tmp_top_layer.append(td_pattern_item)
+                    all_layer.append(td_pattern_item)
+
+                    for j in range(absolute_start, absolute_end):
+                        all_layer_marker.add(j)
+                        # print('aaaaaaa')
+                        # print(all_layer_marker)
+                    continue
+
+                non_overlap_flag = 0
+                top_layer_state = []
+                top_layer_ins = []
+                complete_cover_flag = 0
+                for j in top_layer:
+                    top_layer_state.append(0)
+
+                for j in range(len(top_layer)):
+                    j_absolute_start = top_layer[j][0]
+                    j_absolute_end = top_layer[j][1]
+                    #            -------
+                    # ---------           ------------
+                    if absolute_end < j_absolute_start or j_absolute_end < absolute_start:
+                        non_overlap_flag += 1
+                        continue
+                    #          j_ab_s-----------j_ab_e
+                    #      ab_s------------------------ab_e
+                    if absolute_start <= j_absolute_start and j_absolute_end <= absolute_end:
+                        top_layer_state[j] = 1
+                    #            ---------------                      ------------------
+                    #                   -----------------                              -----------
+                    if absolute_start <= j_absolute_end and j_absolute_start < absolute_start and absolute_end > j_absolute_end:
+                        top_layer_state[j] = 2
+                    #                     ----------------                  -----------------
+                    #        ------------------                  ------------
+                    if absolute_start < j_absolute_start and absolute_end >= j_absolute_start and absolute_end < j_absolute_end:
+                        top_layer_state[j] = 3
+                    #           ---------------------
+                    #                 ---------
+                    if absolute_start >= j_absolute_start and absolute_end <= j_absolute_end:
+                        complete_cover_flag = 1
+
+                if complete_cover_flag == 1:
+                    continue
+
+                if non_overlap_flag == len(top_layer):
+                    TD_item = monomer_sequence[relative_start:relative_start + start_d]
+                    TD_count = int((relative_end - relative_start + 1) / start_d)
+                    TD_range_index = []
+                    relative_end = chain_list[i][int(len(chain_list[i]) / start_d) * start_d - 1][0]
+                    absolute_end = monomer_sequence_index_right[relative_end]
+                    start_td_item = -1
+                    end_td_item = -1
+                    new_start_td_item = relative_start
+                    new_end_td_item = relative_start + start_d - 1
+                    pattern_number = 1
+                    while True:
+                        start_td_item = new_start_td_item
+                        end_td_item = new_end_td_item
+                        if end_td_item > relative_end:
+                            break
+                        adding_flag = 1
+
+                        if monomer_sequence_index_right[end_td_item] in all_layer_marker:
+                            adding_flag = 0
+                        if adding_flag == 1:
+                            TD_range_index.append(
+                                [monomer_sequence_index_left[start_td_item], monomer_sequence_index_right[end_td_item],
+                                 TD_item, pattern_number])
+                            pattern_number = 1
+                            new_start_td_item = end_td_item + 1
+                            new_end_td_item = end_td_item + start_d
+                        else:
+                            pattern_number += 1
+                            new_start_td_item = start_td_item
+                            new_end_td_item = end_td_item + start_d
+
+                    top_layer_ins = [absolute_start, absolute_end, TD_item, TD_count, TD_range_index, relative_start,
+                                     relative_end]
+
+                    top_layer.append(top_layer_ins)
+                    tmp_top_layer.append(top_layer_ins)
+                    all_layer.append(top_layer_ins)
+                    # print(absolute_start)
+                    # print(absolute_end)
+                    for j in range(absolute_start, absolute_end):
+                        all_layer_marker.add(j)
+                        # print('kkkk')
+                        # print(all_layer_marker)
+                else:
+                    processed_absolute_start = absolute_start
+                    processed_absolute_end = absolute_end
+                    processed_relative_start = relative_start
+                    processed_relative_end = relative_end
+                    abandon_flag = 0
+                    while True:
+                        top_layer_ins = []
+                        for j in range(len(top_layer_state)):
+                            #           -------------                  --------------
+                            #                 -------------                          ------------
+                            if top_layer_state[j] == 2:
+                                j_absolute_end = top_layer[j][1]
+                                if j_absolute_end + 1 > processed_absolute_start:
+                                    processed_absolute_start = j_absolute_end + 1
+                            #           -------------                  --------------
+                            #     -------------                  ------
+                            if top_layer_state[j] == 3:
+                                j_absolute_start = top_layer[j][0]
+                                if j_absolute_start - 1 < processed_absolute_end:
+                                    processed_absolute_end = j_absolute_start - 1
+
+                        for k in range(len(monomer_sequence)):
+                            if monomer_sequence_index_left[k] == processed_absolute_start:
+                                processed_relative_start = k
+                            if monomer_sequence_index_right[k] == processed_absolute_end:
+                                processed_relative_end = k
+
+                        TD_count = int((processed_relative_end - processed_relative_start + 1) / start_d)
+                        if TD_count > 1:
+                            processed_relative_end = processed_relative_start + TD_count * start_d - 1
+                            processed_absolute_end = monomer_sequence_index_right[processed_relative_end]
+                            TD_range_index = []
+                            TD_item = monomer_sequence[processed_relative_start:processed_relative_start + start_d]
+
+                            start_td_item = -1
+                            end_td_item = -1
+                            new_start_td_item = processed_relative_start
+                            new_end_td_item = processed_relative_start + start_d - 1
+                            pattern_number = 1
+
+                            while True:
+                                start_td_item = new_start_td_item
+                                end_td_item = new_end_td_item
+                                if end_td_item > processed_relative_end:
+                                    break
+                                adding_flag = 1
+                                if monomer_sequence_index_right[end_td_item] in all_layer_marker:
+                                    adding_flag = 0
+                                if adding_flag == 1:
+                                    # print([monomer_sequence_index[start_td_item], monomer_sequence_index[end_td_item],
+                                    #      TD_item,pattern_number])
+                                    TD_range_index.append(
+                                        [monomer_sequence_index_left[start_td_item],
+                                         monomer_sequence_index_right[end_td_item],
+                                         TD_item, pattern_number])
+
+                                    pattern_number = 1
+                                    new_start_td_item = end_td_item + 1
+                                    new_end_td_item = end_td_item + start_d
+                                else:
+                                    pattern_number += 1
+                                    new_start_td_item = start_td_item
+                                    new_end_td_item = end_td_item + start_d
+
+                            top_layer_ins = [processed_absolute_start, processed_absolute_end,
+                                             TD_item, TD_count, TD_range_index,
+                                             processed_relative_start, processed_relative_end]
+
+                        if len(top_layer_ins) == 0:
+                            abandon_flag = 1
+                            break
+                        if len(top_layer_ins[4]) == 0:
+                            abandon_flag = 1
+                            break
+                        non_overlap_flag = 0
+                        top_layer_state = []
+                        complete_cover_flag = 0
+                        for j in top_layer:
+                            top_layer_state.append(0)
+
+                        for j in range(len(top_layer)):
+                            j_absolute_start = top_layer[j][0]
+                            j_absolute_end = top_layer[j][1]
+                            #            -------
+                            # ---------           ------------
+                            if processed_absolute_end < j_absolute_start or j_absolute_end < processed_absolute_start:
+                                non_overlap_flag += 1
+                                continue
+                            #          j_ab_s-----------j_ab_e
+                            #      ab_s------------------------ab_e
+                            if processed_absolute_start <= j_absolute_start and j_absolute_end <= processed_absolute_end:
+                                top_layer_state[j] = 1
+                            #            ---------------                      ------------------
+                            #                   -----------------                              -----------
+                            if processed_absolute_start <= j_absolute_end and j_absolute_start < processed_absolute_start and processed_absolute_end > j_absolute_end:
+                                top_layer_state[j] = 2
+                            #                     ----------------                  -----------------
+                            #        ------------------                  ------------
+                            if processed_absolute_start < j_absolute_start and processed_absolute_end >= j_absolute_start and processed_absolute_end < j_absolute_end:
+                                top_layer_state[j] = 3
+                            #           ---------------------
+                            #                 ---------
+                            if processed_absolute_start >= j_absolute_start and processed_absolute_end <= j_absolute_end:
+                                complete_cover_flag = 1
+                        processed_flag = 0
+                        for j in top_layer_state:
+                            if j == 3:
+                                processed_flag = 1
+                            if j == 2:
+                                processed_flag = 1
+                        if processed_flag == 0:
+                            break
+
+                    if abandon_flag == 1:
+                        continue
+
+                    new_top_layer = []
+
+                    for j in range(len(top_layer_state)):
+                        if top_layer_state[j] == 1:
+                            continue
+                        else:
+                            new_top_layer.append(top_layer[j])
+                    new_top_layer.append(top_layer_ins)
+                    tmp_top_layer.append(top_layer_ins)
+                    all_layer.append(top_layer_ins)
+                    for j in range(processed_absolute_start, processed_absolute_end):
+                        all_layer_marker.add(j)
+                        # print('llll')
+                        # print(all_layer_marker)
+                    top_layer = new_top_layer
+
+            if len(tmp_top_layer) == 0:
+                start_d += 1
+                continue
+
+            new_monomer_sequence_index_left = []
+            new_monomer_sequence_index_right = []
+            tmp_monomer_sequence_left = []
+            tmp_monomer_sequence_right = []
+            new_monomer_sequence = []
+            for i in monomer_sequence:
+                tmp_monomer_sequence_left.append(i)
+                tmp_monomer_sequence_right.append(i)
+
+            for i in tmp_top_layer:
+                relative_start = i[5]
+                relative_end = i[6]
+                for j in range(relative_end - relative_start + 1):
+                    tmp_monomer_sequence_left[relative_start + j] = '*'
+                    tmp_monomer_sequence_right[relative_end - j] = '*'
+
+                for j in range(start_d):
+                    tmp_monomer_sequence_left[relative_start + j] = monomer_sequence[relative_start + j]
+                    tmp_monomer_sequence_right[relative_end - j] = monomer_sequence[relative_end - j]
+
+            for i in range(len(tmp_monomer_sequence_left)):
+                if tmp_monomer_sequence_left[i] == '*':
+                    continue
+                else:
+                    new_monomer_sequence.append(monomer_sequence[i])
+                    new_monomer_sequence_index_left.append(monomer_sequence_index_left[i])
+
+            for i in range(len(tmp_monomer_sequence_right)):
+                if tmp_monomer_sequence_right[i] == '*':
+                    continue
+                else:
+                    new_monomer_sequence_index_right.append(monomer_sequence_index_right[i])
+
+            start_d = 1
+    return new_monomer_sequence, top_layer, all_layer
+
+def buildingHor(block_sequence,all_layer):
+    final_HOR = {}
+    for i in all_layer:
+        start = i[0]
+        end = i[1]
+        start_block = block_sequence[start].split('_')
+        strand = start_block[-1]
+        pattern = i[2]
+        pattern_range = i[4]
+        # print(pattern)
+        in_flag = 0
+        # 循环前后缀，拼接loop pattern，判断是否存在，
+        # 如果存在in_flag为1：
+        # final_HOR[s_loop_pattern][0]添加新的start end
+        # final_HOR[s_loop_pattern][1] += pattern_range pattern range叠加
+        # 如果不存在in_flag为0：
+        # 创建新的pattern
+        # 修改：以首位block正反表示HOR正反
+        if strand == '-':
+            pattern = pattern[::-1]
+
+        for j in range(len(pattern)): # 循环pattern
+            prefix_pattern = pattern[j:]
+            suffix_pattern = pattern[:j]
+            loop_pattern = prefix_pattern + suffix_pattern
+            s_loop_pattern = ''
+            for k in loop_pattern:
+                s_loop_pattern += str(k) + '_'
+            s_loop_pattern = s_loop_pattern[:-1]
+            if s_loop_pattern in final_HOR.keys():
+                in_flag = 1
+                final_HOR[s_loop_pattern][0].append([start, end])
+                # pattern_range 添加+ / -，然后拼接
+                new_pattern_range = []
+                for k in pattern_range:
+                    new_pattern_range.append([k[0],k[1], strand,k[2],k[3]])
+                final_HOR[s_loop_pattern][1] += new_pattern_range
+                break
+
+        # 如果pattern没有出现，则建立新的
+        if in_flag == 0:
+            s_pattern = ''
+            for j in pattern:
+                s_pattern += str(j) + '_'
+            s_pattern = s_pattern[:-1]
+            new_pattern_range = []
+            for j in pattern_range:
+                new_pattern_range.append([j[0], j[1], strand, j[2], j[3]])
+            final_HOR[s_pattern] = [[[start, end]], new_pattern_range]
+    return final_HOR
+
+def findingHOR(monomer_sequence,block_sequence,cluster_block,max_hor_len):
+    filter_HORs_list = {}
+    new_monomer_sequence, top_layer, all_layer = miningMonomerTDPattern(monomer_sequence, max_hor_len)
+
+    HORs = buildingHor(block_sequence,all_layer)
+    filter_HORs = {}
+    for i in HORs.keys():
+        pattern = i
+        database = HORs[i][1]
+        filter_HOR = []
+        init_sequences = []
+        for j in monomer_sequence:
+            init_sequences.append(0)
+        sort_database = sorted(database, key=lambda x: x[1] - x[0])
+        for j in sort_database:
+            start = j[0]
+            end = j[1]
+            jump = 0
+            for k in range(start, end + 1):
+                if init_sequences[k] == 1:
+                    jump = 1
+                    break
+            if jump == 1:
+                continue
+            else:
+                for k in range(start, end + 1):
+                    init_sequences[k] = 1
+                filter_HOR.append(j)
+        if len(filter_HOR) == 0:
+            continue
+        else:
+            filter_HORs[pattern] = sorted(filter_HOR, key=lambda x: x[0])
+
+    for i in filter_HORs.keys():
+        pattern = i.split('_')
+        pattern_database = filter_HORs[i]
+        in_flag = 0
+        for j in range(len(pattern)):
+            prefix_pattern = pattern[j:]
+            suffix_pattern = pattern[:j]
+            loop_pattern = prefix_pattern + suffix_pattern
+            s_loop_pattern = ''
+            for k in loop_pattern:
+                s_loop_pattern += str(k) + '_'
+            s_loop_pattern = s_loop_pattern[:-1]
+            if s_loop_pattern in filter_HORs_list.keys():
+                in_flag = 1
+                for k in pattern_database:
+                    filter_HORs_list[s_loop_pattern].append([k[0], k[1],k[2], k[3], k[4]])
+                break
+        if in_flag == 0:
+            s_pattern = ''
+            for j in pattern:
+                s_pattern += str(j) + '_'
+            s_pattern = s_pattern[:-1]
+            filter_HORs_list[s_pattern] = []
+            for j in pattern_database:
+                filter_HORs_list[s_pattern].append([j[0], j[1], j[2], j[3],j[4]])
+
+    pattern_score = []
+    for i in filter_HORs_list.keys():
+        cov = 0
+        for j in filter_HORs_list[i]:
+            cov += (j[1] + 1 - j[0])
+        cov_rate = cov / len(monomer_sequence)
+        pattern = i.split('_')
+        repeat_number = 0
+        for j in filter_HORs_list[i]:
+            repeat_number += j[4]
+        pattern_rate = repeat_number / (cov / len(pattern))
+        score = cov_rate * pattern_rate
+        pattern_score.append([score, cov_rate, pattern_rate, i])
+
+    pattern_score = sorted(pattern_score, key=lambda x: x[0], reverse=True)
+    filter_final_HORs = {}
+    marker_sequence = []
+    for i in monomer_sequence:
+        marker_sequence.append(0)
+    for i in pattern_score:
+        database = filter_HORs_list[i[3]]
+        for j in database:
+            start = j[0]
+            end = j[1]
+            for k in range(start, end + 1):
+                marker_sequence[k] = 1
+        filter_final_HORs[i[3]] = database
+
+    cov = 0
+    for i in marker_sequence:
+        if i == 1:
+            cov += 1
+
+    # rename monomer index based on R1, and remain based on frequence
+    # rename
+    # 1 cluster_block
+    # 2 monomer_sequence
+    # 3 filter_final_HORs
+    # 4 top_layer
+    # 5 all_layer
+
+    rename_monomer_ID = {}
+    # getFirst HOR pattern
+    all_patterns = list(filter_final_HORs.keys())
+    if len(all_patterns) != 0:
+        first_pattern_rename = {}
+        first_pattern = all_patterns[0].split('_')
+        monomer_ID = 1
+        for i in first_pattern:
+            if int(i) not in first_pattern_rename.keys():
+                first_pattern_rename[int(i)] = monomer_ID
+                monomer_ID += 1
+        monomer_out_of_first_pattern = {}
+        sorted_cluster_block = sorted(cluster_block.items(),key=lambda x:len(x[1]),reverse=True)
+        for i in sorted_cluster_block:
+            if i[0] not in first_pattern_rename.keys():
+                if i[0] not in monomer_out_of_first_pattern.keys():
+                    monomer_out_of_first_pattern[i[0]] = monomer_ID
+                    monomer_ID += 1
+        for i in first_pattern_rename.keys():
+            rename_monomer_ID[i] = first_pattern_rename[i]
+        for i in monomer_out_of_first_pattern.keys():
+            rename_monomer_ID[i] = monomer_out_of_first_pattern[i]
+
+    else:
+        monomer_ID = 1
+        sorted_cluster_block = sorted(cluster_block.items(), key=lambda x: len(x[1]), reverse=True)
+        for i in sorted_cluster_block:
+            rename_monomer_ID[i[0]]= monomer_ID
+            monomer_ID += 1
+    # using rename_monomer_ID update
+    # 1 cluster_block
+    # 2 monomer_sequence
+    # 3 filter_final_HORs
+    # 4 top_layer
+    # 5 all_layer
+
+    if len(pattern_score) == 0:
+        statistics = [-10, -10, -10, -10, -10]
+        return cluster_block, \
+               filter_final_HORs, statistics,top_layer, all_layer
+
+    max_cov = -1
+    max_cov_pattern = pattern_score[0][3].split('_')
+    max_cov_pattern_monomer = set()
+    for i in max_cov_pattern:
+        max_cov_pattern_monomer.add(i)
+
+    max_cov_rate = pattern_score[0][1]
+    cov_rate = cov / len(monomer_sequence)
+    max_pattern_score = pattern_score[0][0]
+
+    if len(filter_final_HORs.keys()) == 0:
+        CE_rate = -1
+    else:
+        CE_rate = len(max_cov_pattern_monomer) / len(max_cov_pattern)
+
+    statistics = [cov_rate,
+                  len(max_cov_pattern),
+                  max_cov_rate,
+                  CE_rate, max_pattern_score]
+
+    return cluster_block, \
+               filter_final_HORs, statistics,top_layer, all_layer
+
+def outResult(cluster_block,monomer_sequence,
+                       final_HOR,top_layer,
+                        all_layer,statistics, outdir):
+    # final_HOR 更新，增加了正负信息
+    out_monomer_seq = outdir + '/out_monomer_seq.xls'
+    out_monomer_seq = open(out_monomer_seq, 'w')
+    out_monomer_seq.write('mon_seq' + '\t')
+    for i in monomer_sequence:
+        out_monomer_seq.write(str(i) + ' ')
+    out_monomer_seq.write('\n')
+    out_monomer_seq.close()
+    out_cluster = outdir + '/out_cluster.xls'
+    out_cluster = open(out_cluster, 'w')
+    for i in cluster_block.keys():
+        out_cluster.write(str(i))
+        for j in cluster_block[i]:
+            out_cluster.write('\t' + str(j))
+        out_cluster.write('\n')
+    out_cluster.close()
+
+    out_final_hor = outdir + '/out_final_hor.xls' # 更新：增加了正负信息
+    out_final_hor = open(out_final_hor, 'w')
+    for i in final_HOR.keys():
+        out_final_hor.write(i + '\n') # patter名字
+        out_final_hor.write('P(start,end,strand,pattern,repeat_number):')
+        for j in final_HOR[i]:
+            out_final_hor.write('\t' + str(j[0]) + ',' + str(j[1])+','+str(j[2]))
+            pattern = ''
+            for l in j[3]:
+                pattern += str(l) + '_'
+            pattern = pattern[:-1]
+            out_final_hor.write(',' + pattern)
+            out_final_hor.write(',' + str(j[4]))
+        out_final_hor.write('\n')
+    out_final_hor.close()
+
+    # sort output
+    top_layer_set = set()
+    sorted_top_layer = sorted(top_layer,key=lambda x:x[0])
+    out_top_layer = outdir + '/out_top_layer.xls'
+    out_top_layer = open(out_top_layer, 'w')
+
+    layers = {}
+    layers_info = {}
+    for j in sorted_top_layer:
+        start = j[0]
+        end = j[1]
+        pattern = ''
+        repeat_number = j[3]
+        for p in j[2]:
+            pattern += str(p) + '_'
+        pattern = pattern[:-1]
+        top_layer_set.add(pattern+'_'+str(start)+'_'+str(end))
+        out_top_layer.write(str(start)+'\t'+str(end)+'\t'+str(repeat_number)+'\t'+str(pattern)+'\n')
+        layers[pattern +'_'+str(start)+'_'+str(end)] = []
+        layers_info[pattern +'_'+str(start)+'_'+str(end)] = [start,end,repeat_number,pattern]
+    out_top_layer.close()
+    # fix same start region of top and cov
+    sorted_all_layer = sorted(all_layer, key=lambda x: x[0])
+    for j in sorted_all_layer:
+        start = j[0]
+        end = j[1]
+        pattern = ''
+        repeat_number = j[3]
+        for p in j[2]:
+            pattern += str(p) + '_'
+        pattern = pattern[:-1]
+        if pattern + '_' + str(start) + '_' + str(end) in layers.keys():
+            pass
+        else:
+            for l in layers.keys():
+                top_start = int(l.split('_')[-2])
+                top_end = int(l.split('_')[-1])
+                if start >= top_start and end <= top_end:
+                    layers[l].append([start,end,repeat_number,pattern])
+
+    out_all_layer = outdir + '/out_all_layer.xls'
+    out_all_layer = open(out_all_layer, 'w')
+    for j in layers_info.keys():
+        start = layers_info[j][0]
+        end = layers_info[j][1]
+        repeat_number = layers_info[j][2]
+        pattern = layers_info[j][3]
+        out_all_layer.write(
+            str(start) + '\t' + str(end) + '\t' + str(repeat_number) + '\t' + str(pattern) + '\t' + 'top' + '\n')
+        for k in layers[j]:
+            sub_start = k[0]
+            sub_end = k[1]
+            sub_repeat_number = k[2]
+            sub_pattern = k[3]
+            out_all_layer.write(
+                str(sub_start) + '\t' + str(sub_end) + '\t' + str(sub_repeat_number) + '\t' + str(
+                    sub_pattern) + '\t' + 'cover' + '\n')
+    out_all_layer.close()
+
+    out_statistics = outdir + '/out_statistics.xls'
+    out_statistics = open(out_statistics, 'w')
+    out_statistics.write('cov_rate' + '\t' +
+                         'max_cov_pattern_len' + '\t' +
+                         'max_cov_rate' + '\t' +
+                         'CE_rate' + '\t' +
+                         'max_pattern_score' + '\n')
+
+    out_statistics.write(str(statistics[0]) +
+                             '\t' + str(statistics[1]) +
+                             '\t' + str(statistics[2]) +
+                             '\t' + str(statistics[3]) +
+                             '\t' + str(statistics[4]) + '\n')
+    out_statistics.close()
+
+def readPattern(pattern_file):
+    patterns = {}
+    key = ''
+    with open(pattern_file,'r') as pf:
+        while True:
+            line = pf.readline()[:-1]
+            if not line:
+                break
+            key = line
+            patterns[key] = []
+            line = pf.readline()[:-1]
+            itemsets = line.split('\t')[1:]
+            # 增加strand
+            for i in itemsets:
+                r = i.split(',')
+                start = int(r[0])
+                end = int(r[1])
+                strand = r[2]
+                pattern = r[3]
+                repeat_number = int(r[4])
+                patterns[key].append([start,end,strand,pattern,repeat_number])
+    return patterns
+
+def readMonomerSequence(monomer_sequence_file):
+    with open(monomer_sequence_file,'r') as msf:
+            line = msf.readline()[:-2]
+            items = line.split('\t')
+            monomer_sequence = items[1].split(' ')
+    return monomer_sequence
+
+def readCluster(cluster_file):
+    monomer_table = {}
+    with open(cluster_file,'r') as cf:
+        while True:
+            line = cf.readline()[:-1]
+            if not line:
+                break
+            items = line.split('\t')
+            monomer_table[items[0]] = items[1:]
+    return monomer_table
+
+def buildMonomerFile(monomer_table,base_sequence,outdir):
+    out_monomer = outdir + '/out_monomer.fa'
+    out_monomer = open(out_monomer,'w')
+    for i in monomer_table.keys():
+        count = 1
+        database = monomer_table[i]
+        for j in database:
+            item = j.split('_')
+            start = int(item[1])
+            end = int(item[2])
+            strand = item[3]
+            out_monomer.write('>' + str(i) + '.' + str(count) + '::' +str(start) +'-' + str(end) +' ' + strand + '\n')
+            out_monomer.write(base_sequence[start:end+1])
+            out_monomer.write('\n')
+            count += 1
+    out_monomer.close()
+
+def buildHORFile(patterns, pattern_static,base_sequence,monomer_sequence,block_sequence,outdir):
+    out_hor_raw_file = outdir + '/out_hor.raw.fa'
+    out_hor_raw_file = open(out_hor_raw_file,'w')
+    out_hor_normal_file = outdir + '/out_hor.normal.fa'
+    out_hor_normal_file = open(out_hor_normal_file,'w')
+    for i in patterns.keys():
+        pattern_name = pattern_static[i][0]
+        pattern = i.split('_')
+        database = patterns[i]
+        # ([start,end,strand,pattern,repeat_number])
+        for j in database:
+            start = j[0]
+            end = j[1]
+            strand = j[2] # 更新增加strand
+            monomer_sequence_item = monomer_sequence[start:end+1]
+            # patternname.index start end pattern repeatnumber rawpattern
+            monomer_sequence_item_str = ''
+            for k in monomer_sequence_item:
+                monomer_sequence_item_str += str(k) + '_'
+            monomer_sequence_item_str = str(monomer_sequence_item_str[:-1])
+            out_hor_raw_file.write('>' + pattern_name  + '::' +
+                                       str(block_sequence[start][0]) + '-' + str(block_sequence[end][1] + 1) +
+                                   '::' + strand +
+                                       ' nHOR-' + i + '::rHOR-' + monomer_sequence_item_str + '\n')
+            out_hor_raw_file.write(base_sequence[block_sequence[start][0]:block_sequence[end][1] + 1] + '\n')
+
+            out_hor_normal_file.write('>' + pattern_name + '::' +
+                                   str(block_sequence[start][0]) + '-' + str(block_sequence[end][1] + 1) +
+                                      '::' + strand +
+                                   ' nHOR-' + i + '::rHOR-' + monomer_sequence_item_str + '\n')
+
+            if len(pattern) == 1:
+                # 考虑反链 '-' 链标准化变正
+                normal_sequence = base_sequence[block_sequence[start][0]:block_sequence[end][1] + 1]
+                if strand == '-':
+                    normal_sequence = reverse(normal_sequence)
+                out_hor_normal_file.write(normal_sequence + '\n')
+            else:
+                if strand == '-':
+                    monomer_sequence_item = monomer_sequence_item[::-1] # 反链序列翻转
+                    double_sequence = monomer_sequence_item + monomer_sequence_item
+                    double_index = list(range(len(monomer_sequence_item)))[::-1] + \
+                                   list(range(len(monomer_sequence_item)))[::-1] # 反链index翻转
+                    count = 0
+                    prefix = []
+                    pattern_index = 0
+                    for k in range(len(double_sequence)):
+                        if pattern[pattern_index] == double_sequence[k]:
+                            prefix.append([k, double_sequence[k], double_index[k], pattern_index])
+                    normal_pattern = []
+                    for k in prefix:
+                        record = [k]
+                        pattern_index = k[3] + 1
+                        not_find = 0
+                        for l in range(k[0] + 1, len(double_sequence)):
+                            if double_sequence[l] == pattern[pattern_index]:
+                                record.append([l, double_sequence[l], double_index[l], pattern_index])
+                                pattern_index += 1
+                                if pattern_index == len(pattern):
+                                    break
+                            else:
+                                continue_flag = 0
+                                for m in record:
+                                    if double_sequence[l] == m[1]:
+                                        continue_flag = 1
+                                if continue_flag == 1:
+                                    continue
+                                else:
+                                    not_find = 1
+                                    break
+                        if not_find == 1:
+                            continue
+                        if len(record) != len(pattern):
+                            continue
+                        normal_pattern = record
+                    normal_sequence = ''
+                    for k in normal_pattern:
+                        block_start = block_sequence[start + k[2]][0]
+                        block_end = block_sequence[start + k[2]][1] + 1
+                        normal_sequence += reverse(base_sequence[block_start:block_end]) # 每个block变反
+                    out_hor_normal_file.write(normal_sequence + '\n')
+                else:
+                    # +
+                    double_sequence = monomer_sequence_item + monomer_sequence_item
+                    double_index = list(range(len(monomer_sequence_item))) + list(range(len(monomer_sequence_item)))
+                    count = 0
+                    prefix = []
+                    pattern_index = 0
+                    for k in range(len(double_sequence)):
+                        if pattern[pattern_index] == double_sequence[k]:
+                            prefix.append([k, double_sequence[k], double_index[k], pattern_index])
+                    normal_pattern = []
+                    for k in prefix:
+                        record = [k]
+                        pattern_index = k[3] + 1
+                        not_find = 0
+                        for l in range(k[0] + 1, len(double_sequence)):
+                            if double_sequence[l] == pattern[pattern_index]:
+                                record.append([l, double_sequence[l], double_index[l], pattern_index])
+                                pattern_index += 1
+                                if pattern_index == len(pattern):
+                                    break
+                            else:
+                                continue_flag = 0
+                                for m in record:
+                                    if double_sequence[l] == m[1]:
+                                        continue_flag = 1
+                                if continue_flag == 1:
+                                    continue
+                                else:
+                                    not_find = 1
+                                    break
+                        if not_find == 1:
+                            continue
+                        if len(record) != len(pattern):
+                            continue
+                        normal_pattern = record
+                    normal_sequence = ''
+                    for k in normal_pattern:
+                        block_start = block_sequence[start + k[2]][0]
+                        block_end = block_sequence[start + k[2]][1]+1
+                        normal_sequence += base_sequence[block_start:block_end]
+                    out_hor_normal_file.write(normal_sequence + '\n')
+    out_hor_raw_file.close()
+    out_hor_normal_file.close()
+
+def Plot(monomer_sequence, patterns,pattern_static, block_seuqence, outdir, show_number = 5, show_min_repeat_number = 10):
+    fig, ax = plt.subplots(figsize=(10, 10))
+    monomer_len = len(monomer_sequence)
+
+    color = '#D14524'
+    custom_lines = []
+    legend_text = []
+
+    filter_patterns = {}
+    pattern_count = 0
+    for i in patterns.keys():
+        if pattern_count >= show_number:
+            break
+        pattern_name = pattern_static[i][0]
+        pattern_repeat_number = pattern_static[i][1]
+        if pattern_repeat_number < show_min_repeat_number:
+            continue
+        filter_patterns[i] = patterns[i]
+        pattern_count += 1
+
+    re_patterns = list(filter_patterns.keys())[::-1]
+    pattern_count = 0
+    for i in re_patterns:
+        # print(pattern_static[i])
+        pattern_name = pattern_static[i][0]
+        xy = np.array([0, pattern_count * monomer_len / 25])
+        rect = mpathes.Rectangle(xy, monomer_len, monomer_len / 50, color='#D0CECE')
+        ax.add_patch(rect)
+        custom_lines.append(Line2D([0], [0], color=color, lw=2))
+        legend_text.append(i)
+        for j in patterns[i]:
+            start = j[0]
+            end = j[1]
+            xy2 = np.asarray([start, pattern_count * monomer_len / 25])
+            rect = mpathes.Rectangle(xy2, end + 1 - start, monomer_len / 50, color=color,lw=0)
+            ax.add_patch(rect)
+        plt.text(monomer_len + monomer_len / 50, pattern_count * monomer_len / 25, pattern_name, fontsize=10)
+        pattern_count += 1
+
+    xy3 = np.asarray([0, -monomer_len / 50])
+    rect = mpathes.Rectangle(xy3, monomer_len, monomer_len / 1000, color='black')
+    ax.add_patch(rect)
+    point_bar = int(monomer_len / 10)
+    for i in range(10):
+        xy3 = np.asarray([0 + i * point_bar, -monomer_len / 50])
+        rect = mpathes.Rectangle(xy3, monomer_len / 1000, -monomer_len / 100, color='black')
+        ax.add_patch(rect)
+        plt.text(0 + i * point_bar, -monomer_len / 50 - monomer_len / 50, str(block_seuqence[0 + i * point_bar][0]), fontsize=5)
+
+    ax.spines['right'].set_visible(False)
+    ax.spines['left'].set_visible(False)
+    ax.spines['top'].set_visible(False)
+    ax.spines['bottom'].set_visible(False)
+    # ax.legend(custom_lines,legend_text)
+    plt.xticks([])
+    plt.yticks([])
+    plt.axis('equal')
+    plt.savefig(outdir + '/plot_pattern.pdf')
+    plt.close()
+
+    x = np.arange(min(len(filter_patterns.keys()),show_number))
+    y = []
+    y1 = []
+
+    bar_width = 0.35
+
+    tick_label = []
+    for i in filter_patterns.keys():
+        database = patterns[i]
+        pattern = i.split('_')
+        canonical = 0
+        nested = 0
+        for j in database:
+            item_len = int(j[1]) + 1 - int(j[0])
+            if item_len == len(pattern) * j[4]:
+                canonical += j[4]
+            else:
+                nested += j[4]
+        y.append(canonical)
+        y1.append(nested)
+        tick_label.append(pattern_static[i][0])
+
+    pattern_static_file = outdir + '/pattern_static.xls'
+    pattern_static_file = open(pattern_static_file,'w')
+    pattern_static_file.write('HORs\tCanonical\tNested\n')
+
+    for i in range(len(tick_label)):
+        pattern_static_file.write(tick_label[i]+'\t'+str(y[i]) +'\t' +str(y1[i]) + '\n')
+    pattern_static_file.close()
+
+    plt.figure(figsize=(10, 10))
+    plt.bar(x, y, bar_width, align="center", color="c", label="canonical", alpha=0.5)
+    plt.bar(x + bar_width, y1, bar_width, color="b", align="center", label="nested", alpha=0.5)
+
+    plt.xlabel("HORs")
+    plt.ylabel("Repeat Number")
+
+    plt.xticks(x + bar_width / 2, tick_label)
+
+    plt.legend()
+
+    plt.savefig(outdir + '/pattern_static.pdf')
+    plt.close()
+
+def readTopLayer(top_layer_file):
+    top_layer = []
+    with open(top_layer_file,'r') as tf:
+        while True:
+            line = tf.readline()[:-1]
+            if not line:
+                break
+            items = line.split('\t')
+            top_layer.append(items)
+    return top_layer
+
+def readAllLayer(all_layer_file):
+    all_layer = []
+    with open(all_layer_file, 'r') as tf:
+        while True:
+            line = tf.readline()[:-1]
+            if not line:
+                break
+            items = line.split('\t')
+            all_layer.append(items)
+    return all_layer
+
+
+def getFinalResult(base_sequence,block_sequence,outdir,show_hor_number,show_hor_min_repeat_number):
+    pattern_file = outdir + '/out_final_hor.xls' # 存在更新
+    cluster_file = outdir + '/out_cluster.xls'
+    pattern_repeat_file = outdir + '/hor.repeatnumber.xls'
+    monomer_sequence_file = outdir +'/out_monomer_seq.xls'
+
+    patterns = readPattern(pattern_file) # 更新增加strand [start,end,strand,pattern,repeat_number]
+    monomer_sequence = readMonomerSequence(monomer_sequence_file)
+
+    new_block_sequence = []
+    for i in block_sequence:
+        item = i.split('_')
+        start = int(item[1])
+        end = int(item[2])
+        strand = item[3]
+        new_block_sequence.append([start, end, strand])
+    block_sequence = new_block_sequence
+
+    pattern_static = {}
+    pattern_index = 1
+
+    pattern_repeat_file = open(pattern_repeat_file,'w')
+    pattern_repeat_file.write('HORs\tRepeatNumber\n')
+
+    for i in patterns.keys():
+        pattern = i.split('_')
+        database = patterns[i] # 增加了strand
+        repeat_number = 0
+        for j in database:
+            repeat_number += j[4]
+        pattern_name = 'R'+str(pattern_index) + 'L' + str(len(pattern))
+        pattern_repeat_file.write(pattern_name+'\t'+str(repeat_number) + '\n')
+        pattern_static[i] = [pattern_name,repeat_number]
+        pattern_index += 1
+    pattern_repeat_file.close()
+    Plot(monomer_sequence, patterns, pattern_static, block_sequence, outdir,
+         show_number=show_hor_number,show_min_repeat_number=show_hor_min_repeat_number)
+
+    monomer_table = readCluster(cluster_file)
+    buildMonomerFile(monomer_table, base_sequence, outdir)
+    buildHORFile(patterns, pattern_static,base_sequence,monomer_sequence,block_sequence,outdir)
+
+    top_layer_file = outdir + '/out_top_layer.xls'
+    all_layer_file = outdir + '/out_all_layer.xls'
+    top_layer = readTopLayer(top_layer_file)
+    all_layer = readAllLayer(all_layer_file)
+
+    # add name
+    # print(pattern_static)
+
+    new_top_layer = []
+    for i in top_layer:
+        start = int(i[0])
+        end = int(i[1])
+        repeat_number = i[2]
+        pattern = i[3].split('_')
+        in_flag = 0
+        for j in range(len(pattern)):
+            prefix_pattern = pattern[j:]
+            suffix_pattern = pattern[:j]
+            loop_pattern = prefix_pattern + suffix_pattern
+            s_loop_pattern = ''
+            for k in loop_pattern:
+                s_loop_pattern += str(k) + '_'
+            s_loop_pattern = s_loop_pattern[:-1]
+            if s_loop_pattern in pattern_static.keys():
+                in_flag = 1
+                new_top_layer.append([start, end, repeat_number, i[3], pattern_static[s_loop_pattern][0]])
+                break
+        if in_flag == 0:
+            r_pattern = pattern[::-1]
+            for j in range(len(r_pattern)):
+                prefix_pattern = r_pattern[j:]
+                suffix_pattern = r_pattern[:j]
+                loop_pattern = prefix_pattern + suffix_pattern
+                s_loop_pattern = ''
+                for k in loop_pattern:
+                    s_loop_pattern += str(k) + '_'
+                s_loop_pattern = s_loop_pattern[:-1]
+                if s_loop_pattern in pattern_static.keys():
+                    in_flag = 1
+                    new_top_layer.append([start, end, repeat_number, i[3], pattern_static[s_loop_pattern][0]])
+                    break
+
+
+    out_top_layer_file = outdir + '/out_top_layer.xls'
+    out_top_layer_file = open(out_top_layer_file, 'w')
+    for i in new_top_layer:
+        out_top_layer_file.write(
+            i[4] + '\t' + str(block_sequence[i[0]][0]) + '\t' + str(block_sequence[i[1]][1]) + '\t' + i[2] + '\t' + i[
+                3] + '\n')
+    out_top_layer_file.close()
+
+    new_all_layer = []
+    for i in all_layer:
+        start = int(i[0])
+        end = int(i[1])
+        repeat_number = i[2]
+        pattern = i[3].split('_')
+        type = i[4]
+        in_flag = 0
+        for j in range(len(pattern)):
+            prefix_pattern = pattern[j:]
+            suffix_pattern = pattern[:j]
+            loop_pattern = prefix_pattern + suffix_pattern
+            s_loop_pattern = ''
+            for k in loop_pattern:
+                s_loop_pattern += str(k) + '_'
+            s_loop_pattern = s_loop_pattern[:-1]
+            if s_loop_pattern in pattern_static.keys():
+                in_flag = 1
+                new_all_layer.append([start, end, repeat_number, i[3], pattern_static[s_loop_pattern][0], type])
+                break
+        if in_flag == 0:
+            r_pattern = pattern[::-1]
+            for j in range(len(r_pattern)):
+                prefix_pattern = r_pattern[j:]
+                suffix_pattern = r_pattern[:j]
+                loop_pattern = prefix_pattern + suffix_pattern
+                s_loop_pattern = ''
+                for k in loop_pattern:
+                    s_loop_pattern += str(k) + '_'
+                s_loop_pattern = s_loop_pattern[:-1]
+                if s_loop_pattern in pattern_static.keys():
+                    in_flag = 1
+                    new_all_layer.append([start, end, repeat_number, i[3], pattern_static[s_loop_pattern][0], type])
+                    break
+    out_all_layer_file = outdir + '/out_all_layer.xls'
+    out_all_layer_file = open(out_all_layer_file, 'w')
+    for i in new_all_layer:
+        out_all_layer_file.write(
+            i[4] + '\t' + str(block_sequence[i[0]][0]) + '\t' + str(block_sequence[i[1]][1]) + '\t' + i[2] + '\t' + i[
+                3] + '\t' + i[5] + '\n')
+    out_all_layer_file.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Mining HOR")
+    parser.add_argument("-d", "--decomposition_path")
+    parser.add_argument("-b", "--base_sequence_path")
+    parser.add_argument("-tm", "--template_monomers")
+    parser.add_argument("-o", "--outdir")
+
+
+    parser.add_argument("-s", "--min_similarity", type=float, default=0.9)
+    parser.add_argument("-m", "--max_hor_len", type=int, default=40)
+    parser.add_argument("-t", "--thread", type=int, default=1)
+    parser.add_argument("-sp", "--show_hor_number", type=int, default=5)
+    parser.add_argument("-sn", "--show_hor_min_repeat_number", type=int, default=10)
+
+    args = parser.parse_args()
+
+    decomposition_path = args.decomposition_path
+    base_sequence_path = args.base_sequence_path
+    template_monomers = args.template_monomers
+    outdir = args.outdir
+
+    min_similarity = args.min_similarity
+    max_hor_len = args.max_hor_len
+    thread = args.thread
+
+    show_hor_number = args.show_hor_number
+    show_hor_min_repeat_number = args.show_hor_min_repeat_number
+
+    print('build block sequence and read base sequence')
+    base_sequence = ''
+    with open(base_sequence_path, 'r') as f:
+        f.readline()
+        base_sequence = f.readline()[:-1]
+    block_sequence = buildMonomerBlockSequence(decomposition_path)
+
+    monomers = readHiCATMonomers(template_monomers)
+    print('calculate ed distance')
+    print('ed distance thread: ' + str(thread))
+    edit_distance_matrix, \
+        block_name_index, \
+        monomer_name_index = calculateED(block_sequence, monomers, base_sequence, thread)
+    eddis = pd.DataFrame(edit_distance_matrix, index=block_name_index, columns=monomer_name_index)
+    eddis.to_csv(outdir + '/re_eddis.xls', sep='\t')
+    print('transform read block sequences to monomer sequences')
+    uniq_monomer_ID = -1
+    cluster_block = {}
+    monomer_label = {}
+    for i in range(len(block_name_index)):
+        block_name = block_name_index[i]
+        minindex = np.argmin(edit_distance_matrix[i])
+        min_monomer = int(monomer_name_index[minindex])
+        max_identity = 1 - edit_distance_matrix[i][minindex]
+        if max_identity < min_similarity:
+            cluster_block[uniq_monomer_ID] = [block_name]
+            monomer_label[block_name] = uniq_monomer_ID
+            uniq_monomer_ID = uniq_monomer_ID - 1
+        else:
+            if min_monomer not in cluster_block.keys():
+                cluster_block[min_monomer] = [block_name]
+                monomer_label[block_name] = min_monomer
+            else:
+                cluster_block[min_monomer].append(block_name)
+                monomer_label[block_name] = min_monomer
+    monomer_sequence = []
+    for i in block_sequence:
+        monomer_sequence.append(monomer_label[i])
+    print('finding HOR thread: ' + str(1))
+    cluster_block, \
+        filter_final_HORs, statistics, top_layer, all_layer = findingHOR(monomer_sequence,block_sequence, cluster_block, max_hor_len)
+
+    print('get result')
+    outResult(cluster_block, monomer_sequence,
+              filter_final_HORs, top_layer,
+              all_layer, statistics, outdir)
+    getFinalResult(base_sequence, block_sequence, outdir, show_hor_number, show_hor_min_repeat_number)
+
+
+
+if __name__ == '__main__':
+    main()
